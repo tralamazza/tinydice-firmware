@@ -1,13 +1,16 @@
+PROG= tinydice
 CC= avr-gcc
-CFLAGS+= -g -mmcu=attiny13 -Wall -Wextra -std=gnu99 -Os
-PORT= /dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A5005CUN-if00-port0
+CXX= avr-g++
+CFLAGS+= -mmcu=attiny13a -Wall -Wextra -std=gnu99 -Os -flto -fwhole-program
+PORT= /dev/ttyACM0
+PROGRAMMER= avrispv2
 
-all: tinydice
+all: ${PROG}
 
-flash: tinydice
-	printf "m\n1\n" > ${PORT}
-	avrdude -c buspirate -P ${PORT} -p t13 -v -V -U hfuse:w:$^:e -U lfuse:w:$^:e -U flash:w:$^:e
-	printf "m\n9\nW\n" > ${PORT}
+flash: ${PROG}
+	avrdude -c ${PROGRAMMER} -P ${PORT} -p t13 -v -V -U hfuse:w:$^:e -U lfuse:w:$^:e -U flash:w:$^:e
 
 clean:
-	-rm -f tinydice
+	-rm -f ${PROG}
+
+.PHONY: clean flash
