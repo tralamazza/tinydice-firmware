@@ -5,7 +5,7 @@
 
 #define LOOPS_UNTIL_SLEEP 	20000
 #define LOOPS_UNTIL_FLIP 	80
-#define BTN_MASK 			_BV(PB1)
+#define BTN_MASK 		_BV(PB1)
 
 #define BUTTON_RELEASED()	(PINB & BTN_MASK)
 #define BUTTON_PRESSED()	(!BUTTON_RELEASED())
@@ -102,7 +102,7 @@ display(uint8_t number, uint8_t * side)
 		if (dice_combi[number] & _BV(i)) {
 			DDRB = right_plex[i] | left_plex[i];
 			PORTB = BTN_MASK | side[i];
-			__builtin_avr_delay_cycles(30); // XXX LED intensity
+			__builtin_avr_delay_cycles(24); // XXX LED intensity
 		}
 	}
 }
@@ -139,12 +139,16 @@ main(void)
 					show_dice = 1;
 					sleep_counter = 0;
 					state = TD_RESULT;
-				} else if (++flip_counter >= LOOPS_UNTIL_FLIP) {
-					flip_counter = 0;
+					// shows the next roll
 					number_left = random_dice();
 					number_right = random_dice();
+				} else if (++flip_counter >= LOOPS_UNTIL_FLIP) {
+					flip_counter = 0;
 					show_dice = !show_dice;
-					if (!show_dice) {
+					if (show_dice) {
+						number_left = random_dice();
+						number_right = random_dice();
+					} else {
 						display_off();
 					}
 				}
