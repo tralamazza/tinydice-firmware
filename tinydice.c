@@ -1,136 +1,158 @@
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <avr/sleep.h>
-#include <avr/pgmspace.h>
 
+
+#define LOOPS_UNTIL_SLEEP 	20000
+#define LOOPS_UNTIL_FLIP 	80
+#define BTN_MASK 			_BV(PB1)
+
+#define BUTTON_RELEASED()	(PINB & BTN_MASK)
+#define BUTTON_PRESSED()	(!BUTTON_RELEASED())
+
+// http://eleccelerator.com/fusecalc/fusecalc.php?chip=attiny13a
 FUSES =
 {
-  .low = (FUSE_SPIEN & FUSE_SUT0 & FUSE_CKSEL0),
-  .high = HFUSE_DEFAULT,
+	.low = (FUSE_SPIEN & FUSE_SUT0 & FUSE_CKSEL0 & FUSE_CKDIV8),
+	.high = HFUSE_DEFAULT,
 };
 
-
-const uint8_t button = (1 << PIN1);//gives pin position
-const uint32_t sleep_loops = 70000;
-
-
- uint8_t left[]  = {
-	(1 << DDB0), // 3 is on
-	(1 << DDB2), // 3 is on
-	(1 << DDB3),//4 is on
-	(1 << DDB0)//4 is on
+enum td_state {
+	TD_RESULT,
+	TD_SHUFFLING,
 };
 
- uint8_t right[]  = {
-	(1 << DDB2), // 3 is on
-	(1 << DDB3), // 3 is on
-	(1 << DDB4),//4 is on
-	(1 << DDB3)//4 is on
+static uint8_t right_plex[] = {
+	_BV(DDB0),
+	_BV(DDB2),
+	_BV(DDB3),
+	_BV(DDB0)
 };
 
- uint8_t dice[]  = {
-	0b0001, //1
-	0b0010, //2
-	0b0011, //3
-	0b0110, //4
-	0b0111, //5
-	0b1110, //6
-	0b1111
+static uint8_t left_plex[] = {
+	_BV(DDB2),
+	_BV(DDB3),
+	_BV(DDB4),
+	_BV(DDB3)
 };
 
+static uint8_t dice_combi[] = {
+	0b0001, // 1
+	0b0010, // 2
+	0b0011, // 3
+	0b0110, // 4
+	0b0111, // 5
+	0b1110, // 6
+	0b1111, // all on
+};
 
-static uint16_t random_seed = 1;
+// INT0 and PB1 (button) share the same pin (6)
+EMPTY_INTERRUPT(INT0_vect);
 
+static void
+display_off(void)
+{
+	DDRB = 0; // all input
+	PORTB = BTN_MASK; // pull-up only button pin
+}
+
+static void
+go_sleep(void)
+{
+	display_off();
+	set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+	cli();
+	GIMSK = _BV(INT0);
+	sleep_enable();
+	sei();
+	sleep_cpu();
+	// wake up here
+	GIMSK &= ~_BV(INT0);
+	sleep_disable();
+}
+
+// 16 bit xorshift http://www.retroprogramming.com/2017/07/xorshift-pseudorandom-numbers-in-z80.html
 static uint16_t
 random(void)
 {
-  random_seed ^= random_seed << 13;
-  random_seed ^= random_seed >> 9;
-  random_seed ^= random_seed << 7;
-  return (random_seed);
+	static uint16_t random_state = 1; // XXX seed from flash?
+
+	random_state ^= random_state << 9;
+	random_state ^= random_state >> 7;
+	random_state ^= random_state << 13;
+	return (random_state);
 }
 
-
-void switchLED(int on, int location, int isright)
+// https://cvsweb.openbsd.org/cgi-bin/cvsweb/~checkout~/src/lib/libc/crypt/arc4random_uniform.c
+static uint8_t
+random_dice(void)
 {
-	DDRB = dice[0];
-	if (isright){
-		PORTB =  right[location] | button;// what is high/ pull up
-	} else {
-		PORTB =  left[location] | button;// what is high/ pull up
-	}
-	if (on) {
-		DDRB = right[location] | left[location]; //what is output
-	} else {
-		DDRB = 0;
-	}
-
+	uint16_t x;
+	do {
+		x = random();
+	} while (x > 0xFFFB);
+	return x % 6;
 }
 
-ISR(INT0_vect)
+static void
+display(uint8_t number, uint8_t * side)
 {
-	GIMSK &= ~_BV(INT0);
-}
-
-int main(void)
-{
-
-	int n1=0;
-	int n2=0;
-	int buttontime=2;
-	int buttonpressed=0;
-	uint32_t time_loops = 0;
-
-	PORTB |= button;
- 
-	for ( ; ; ) {
-		//if button down increment button time
-		if ((PINB & button) == 0) {
-			buttontime++;
-			buttonpressed=1;
-			n1=n2=6;
-			time_loops = 0;
-		} else {
-			if (buttonpressed){
-				random_seed += buttontime;
-				if (random_seed == 0)
-					random_seed = 1;
-				while ((n1 = (random() & 7)) >= 6)
-					/* NOTHING */;
-				while ((n2 = (random() & 7)) >= 6)
-					/* NOTHING */;
-				buttonpressed=0;
-			}
+	for (int i = 0; i < 4; i++) {
+		display_off();
+		if (dice_combi[number] & _BV(i)) {
+			DDRB = right_plex[i] | left_plex[i];
+			PORTB = BTN_MASK | side[i];
+			__builtin_avr_delay_cycles(30); // XXX LED intensity
 		}
+	}
+}
 
+int
+main(void)
+{
+	/*
+	  states (action -> new state):
+		- show result (no button press for a while -> powerdown OTHERWISE button press -> shuffle)
+		- shuffle (button release -> show result)
+		- powerdown (button press -> shuffle)
+	*/
+	enum td_state state = TD_RESULT;
+	uint8_t number_left = 0, number_right = 0; // 0 -> "1"
+	uint8_t show_dice = 1;
+	uint32_t sleep_counter = 0, flip_counter = 0;
 
-		for (int i=0; i<4; i++) {	
-			switchLED(dice[n1]&(1<<i), i, 1);
-			for (volatile long i = 0; i < 10; i++)
-				/* NOTHING */;
-				switchLED(dice[n2]&(1<<i), i, 0);
-			for (volatile long i = 0; i < 10; i++)
-				/* NOTHING */;
+	display_off();
+	for (;;) {
+		switch (state) {
+			case TD_RESULT:
+				if (++sleep_counter >= LOOPS_UNTIL_SLEEP) {
+					sleep_counter = 0;
+					go_sleep();
+				}
+				if (BUTTON_PRESSED()) {
+					flip_counter = 0;
+					state = TD_SHUFFLING;
+				}
+				break;
+			case TD_SHUFFLING:
+				if (BUTTON_RELEASED()) {
+					show_dice = 1;
+					sleep_counter = 0;
+					state = TD_RESULT;
+				} else if (++flip_counter >= LOOPS_UNTIL_FLIP) {
+					flip_counter = 0;
+					number_left = random_dice();
+					number_right = random_dice();
+					show_dice = !show_dice;
+					if (!show_dice) {
+						display_off();
+					}
+				}
+				break;
 		}
-
-		time_loops++;
-		if (time_loops >= sleep_loops) {
-			n1=n2=6;
-			time_loops = 0;
-			DDRB = 0;
-			PORTB = button;
-
-			set_sleep_mode(SLEEP_MODE_PWR_DOWN);
-
-			cli();
-			while ((PINB & button) != 0) {
-				GIMSK |= _BV(INT0);
-				sleep_enable();
-				sei();
-				sleep_cpu();
-				GIMSK &= ~_BV(INT0);
-				sleep_disable();
-			}
+		if (show_dice) {
+			display(number_left, left_plex);
+			display(number_right, right_plex);
 		}
 	}
 }
